@@ -8,13 +8,14 @@
  */
 
 import React, { useEffect, useState, useCallback } from "react";
+import { useTheme } from "../app/_layout";
 import {
   View, Text, StyleSheet, FlatList, TouchableOpacity,
   Platform, RefreshControl, Alert,
 } from "react-native";
-import { useColorScheme } from "react-native";
+
 import { useFocusEffect } from "expo-router";
-import { lightTheme, darkTheme } from "../constants/theme";
+
 import {
   loadTradeLog, loadGoals, getTodaySummary,
   TradeEntry, UserGoals, DaySummary,
@@ -23,8 +24,9 @@ import {
 type LogFilter = "ALL" | "TODAY" | "OPEN" | "CLOSED";
 
 export default function TradeLogScreen() {
-  const scheme = useColorScheme();
-  const theme  = scheme === "dark" ? darkTheme : lightTheme;
+  const { theme } = useTheme();
+
+
 
   const [log,      setLog]      = useState<TradeEntry[]>([]);
   const [goals,    setGoals]    = useState<UserGoals | null>(null);
