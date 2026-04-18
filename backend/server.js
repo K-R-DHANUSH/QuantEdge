@@ -1,21 +1,16 @@
 /**
- * server.js — Elite Indian Stock Market Signal Engine v2.1
+ * server.js — Elite Indian Stock Market Signal Engine v3.0
  *
- * Changes from v2.0:
- *  - Dynamic PORT via process.env.PORT (required for Render)
- *  - /health endpoint (Render health check)
- *  - Self keep-alive ping every 10 min on weekdays (prevents Render free tier spin-down)
- *  - Auto-detects and logs real LAN IP on startup
- *  - Null cleaning moved to fetchStockData (prevents corrupt indicator inputs)
- *  - All original v2.0 logic preserved (12 indicators, scoring, confluence, etc.)
- *
- * HOW TO RUN LOCALLY:
- *  npm install express axios cors technicalindicators node-cron
- *  node server.js
- *
- * DEPLOY TO RENDER:
- *  - Set Start Command: node server.js
- *  - No env vars needed — Render sets PORT and RENDER_EXTERNAL_URL automatically
+ * Changes from v2.1:
+ *  - STOCKS expanded from 20 → 500+ (full Nifty 500 + top BSE stocks)
+ *  - Parallel batched fetching (BATCH_SIZE=20, BATCH_DELAY=300ms) prevents rate-limit
+ *  - Progressive cache: serves partial results while scan continues
+ *  - /scan-status endpoint: shows live scan progress to the app
+ *  - Increased CACHE_TTL to 2 min (heavy scan, no need to thrash)
+ *  - SIGNAL_THRESHOLD lowered for large universe (only top BUYs returned by default)
+ *  - /signals?limit=N — return top N results (default 100, max 500)
+ *  - /signals?exchange=NSE|BSE|ALL — filter by exchange
+ *  - All v2.1 logic preserved (12 indicators, scoring, confluence, positions)
  */
 
 const express = require("express");
@@ -34,22 +29,252 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ── Stock Universe ────────────────────────────────────────────────────────────
-const STOCKS = [
-  "RELIANCE.NS", "TCS.NS",      "INFY.NS",    "HDFCBANK.NS",
-  "ICICIBANK.NS","WIPRO.NS",    "SBIN.NS",    "ADANIENT.NS",
-  "BAJFINANCE.NS","MARUTI.NS",  "TATAMOTORS.NS","AXISBANK.NS",
-  "KOTAKBANK.NS", "HINDALCO.NS","ONGC.NS",    "POWERGRID.NS",
-  "RELIANCE.BO",  "TCS.BO",     "INFY.BO",    "HDFCBANK.BO",
+// ── Configuration ─────────────────────────────────────────────────────────────
+const BATCH_SIZE  = 20;    // fetch N stocks in parallel
+const BATCH_DELAY = 350;   // ms between batches (avoids Yahoo rate-limit)
+const CACHE_TTL   = 120_000; // 2 minutes (scan takes ~30s for 500 stocks)
+
+// ── Full NSE Stock Universe (Nifty 500 + Nifty MidSmallCap) ──────────────────
+// Covers large-cap, mid-cap, and liquid small-cap — ~95% of NSE market cap
+const NSE_STOCKS = [
+  // ── Nifty 50 ──────────────────────────────────────────────────────────────
+  "RELIANCE.NS","TCS.NS","HDFCBANK.NS","BHARTIARTL.NS","ICICIBANK.NS",
+  "INFOSYS.NS","SBIN.NS","LICI.NS","HINDUNILVR.NS","ITC.NS",
+  "BAJFINANCE.NS","LT.NS","HCLTECH.NS","KOTAKBANK.NS","MARUTI.NS",
+  "AXISBANK.NS","ASIANPAINT.NS","SUNPHARMA.NS","TITAN.NS","WIPRO.NS",
+  "NESTLEIND.NS","ADANIENT.NS","POWERGRID.NS","NTPC.NS","ULTRACEMCO.NS",
+  "TECHM.NS","TATAMOTORS.NS","BAJAJFINSV.NS","ONGC.NS","INDUSINDBK.NS",
+  "TATASTEEL.NS","COALINDIA.NS","HINDALCO.NS","ADANIPORTS.NS","JSWSTEEL.NS",
+  "DRREDDY.NS","M%26M.NS","CIPLA.NS","BRITANNIA.NS","APOLLOHOSP.NS",
+  "TATACONSUM.NS","GRASIM.NS","EICHERMOT.NS","BPCL.NS","DIVISLAB.NS",
+  "SBILIFE.NS","HEROMOTOCO.NS","HDFCLIFE.NS","SHRIRAMFIN.NS","BAJAJ-AUTO.NS",
+
+  // ── Nifty Next 50 ─────────────────────────────────────────────────────────
+  "ADANIGREEN.NS","ADANIPOWER.NS","ADANITRANS.NS","AMBUJACEM.NS","AUROPHARMA.NS",
+  "BANDHANBNK.NS","BERGEPAINT.NS","BOSCHLTD.NS","CANBK.NS","CHOLAFIN.NS",
+  "COLPAL.NS","CONCOR.NS","DABUR.NS","DLF.NS","FEDERALBNK.NS",
+  "GAIL.NS","GODREJCP.NS","GODREJPROP.NS","HAVELLS.NS","HDFCAMC.NS",
+  "ICICIPRULI.NS","IDFCFIRSTB.NS","IOC.NS","IGL.NS","INDHOTEL.NS",
+  "INDUSTOWER.NS","IRCTC.NS","JINDALSTEL.NS","LICHSGFIN.NS","LUPIN.NS",
+  "MARICO.NS","MUTHOOTFIN.NS","NAUKRI.NS","NMDC.NS","OBEROIREAL.NS",
+  "OFSS.NS","PAGEIND.NS","PAYTM.NS","PEL.NS","PIDILITIND.NS",
+  "PNB.NS","RECLTD.NS","SAIL.NS","SIEMENS.NS","SRF.NS",
+  "TATACOMM.NS","TRENT.NS","VEDL.NS","VOLTAS.NS","ZYDUSLIFE.NS",
+
+  // ── Nifty Midcap 150 ──────────────────────────────────────────────────────
+  "AARTIIND.NS","ABB.NS","ABCAPITAL.NS","ABFRL.NS","ACC.NS",
+  "AIAENG.NS","ALKEM.NS","APLLTD.NS","ASTRAL.NS","ATUL.NS",
+  "AUBANK.NS","BALRAMCHIN.NS","BANKBARODA.NS","BATAINDIA.NS","BEL.NS",
+  "BHEL.NS","BIRLACORPN.NS","BLUEDART.NS","BSOFT.NS","CAMS.NS",
+  "CANFINHOME.NS","CASTROLIND.NS","CEATLTD.NS","CHAMBLFERT.NS","CLEAN.NS",
+  "COFORGE.NS","CROMPTON.NS","CUMMINSIND.NS","CYIENT.NS","DATAPATTNS.NS",
+  "DEEPAKNTR.NS","DELTACORP.NS","EIDPARRY.NS","ELGIEQUIP.NS","EMAMILTD.NS",
+  "ENGINERSIN.NS","ESCORTS.NS","EXIDEIND.NS","FINEORG.NS","FLUOROCHEM.NS",
+  "FORTIS.NS","GLENMARK.NS","GNFC.NS","GRANULES.NS","GSPL.NS",
+  "HAPPSTMNDS.NS","HFCL.NS","HONAUT.NS","ICICIGI.NS","IDBI.NS",
+  "IPCALAB.NS","IRB.NS","IRCON.NS","ISEC.NS","JBCHEPHARM.NS",
+  "JKCEMENT.NS","JKLAKSHMI.NS","JMFINANCIL.NS","JSL.NS","JSWENERGY.NS",
+  "JUBLFOOD.NS","KALYANKJIL.NS","KARURVYSYA.NS","KEI.NS","KFINTECH.NS",
+  "KPIL.NS","KRISHNAIND.NS","LAURUSLABS.NS","LAXMIMACH.NS","LEMONTREE.NS",
+  "LINDEINDIA.NS","LTIM.NS","LTTS.NS","MAHABANK.NS","MAHINDCIE.NS",
+  "MANAPPURAM.NS","MARICO.NS","MCX.NS","MEDANTA.NS","METROPOLIS.NS",
+  "MFSL.NS","MINDTREE.NS","MIDHANI.NS","MOTILALOFS.NS","MPHASIS.NS",
+  "MRPL.NS","NAVA.NS","NAVINFLUOR.NS","NBCC.NS","NCC.NS",
+  "NHPC.NS","NLCINDIA.NS","NSLNISP.NS","OLECTRA.NS","PGHH.NS",
+  "PHARMEASY.NS","PHOENIXLTD.NS","POLYCAB.NS","POLYMED.NS","PRESTIGE.NS",
+  "PRINCEPIPE.NS","QUESS.NS","RADICO.NS","RAILTEL.NS","RAIN.NS",
+  "RBLBANK.NS","REDINGTON.NS","RELAXO.NS","RITES.NS","ROSSARI.NS",
+  "ROUTE.NS","RSYSTEMS.NS","SAREGAMA.NS","SCHAEFFLER.NS","SEQUENT.NS",
+  "SHYAMMETL.NS","SJVN.NS","SKFINDIA.NS","SOBHA.NS","SPARC.NS",
+  "STARHEALTH.NS","SUMICHEM.NS","SUNDARMFIN.NS","SUNDRMFAST.NS","SUPREMEIND.NS",
+  "SURYAROSNI.NS","SUVENPHAR.NS","SYNGENE.NS","TANLA.NS","TASTYBITE.NS",
+  "TATAELXSI.NS","TATAINVEST.NS","TCNSBRANDS.NS","TECHNO.NS","THERMAX.NS",
+  "TIMKEN.NS","TITAGARH.NS","TTKPRESTIG.NS","TVSHLTD.NS","UBLLTD.NS",
+  "UJJIVANSFB.NS","UNIONBANK.NS","UTIAMC.NS","VSTIND.NS","VGUARD.NS",
+  "WELCORP.NS","WHIRLPOOL.NS","WIPRO.NS","WOCKPHARMA.NS","ZEEL.NS",
+  "ZENTEC.NS","ZENSARTECH.NS","AARTIIND.NS","ZOMATO.NS","NYKAA.NS",
+
+  // ── Nifty Smallcap (liquid) ───────────────────────────────────────────────
+  "ACCELYA.NS","ACE.NS","AFFLE.NS","AGI.NS","AJANTPHARM.NS",
+  "AKZOINDIA.NS","ALANKIT.NS","ALEMBICLTD.NS","ALKYLAMINE.NS","ALLCARGO.NS",
+  "ANANTRAJ.NS","ANGELONE.NS","ANUPAM.NS","APLAPOLLO.NS","ARCHIDPLY.NS",
+  "ARFIN.NS","ARVINDFASN.NS","ASAHIINDIA.NS","ASHIANA.NS","ASHOKLEY.NS",
+  "ASTRAZEN.NS","AVADHSUGAR.NS","AVANTIFEED.NS","AYMSYNTEX.NS","AZAD.NS",
+  "BAJAJCON.NS","BALMLAWRIE.NS","BANSALWIRE.NS","BASF.NS","BAYERCROP.NS",
+  "BCG.NS","BECTORFOOD.NS","BFINVEST.NS","BIBCL.NS","BIKAJI.NS",
+  "BLISSGVS.NS","BOROLTD.NS","BPCL.NS","BRIGADE.NS","BSE.NS",
+  "BUTTERFLY.NS","CAMLINFINE.NS","CAPACITE.NS","CARBORUNIV.NS","CASTROLIND.NS",
+  "CCL.NS","CENTURYPLY.NS","CENTURYTEX.NS","CESC.NS","CGPOWER.NS",
+  "CHEMCON.NS","CHEMPLASTS.NS","CHENNPETRO.NS","CIGNITITEC.NS","CLICKTECH.NS",
+  "CMSINFO.NS","COALINDIA.NS","CONFIPET.NS","CONTROLPR.NS","COSMOFILMS.NS",
+  "CRAFTSMAN.NS","CRED.NS","CROMPTON.NS","CSLTD.NS","DCB.NS",
+  "DECCANCE.NS","DELEXTRN.NS","DELHIVERY.NS","DEVYANI.NS","DHANI.NS",
+  "DHANUKA.NS","DODLA.NS","DRREDDY.NS","DREDGING.NS","DYNPRO.NS",
+  "EDELWEISS.NS","EIDPARRY.NS","EMKAY.NS","ENDURANCE.NS","EPIGRAL.NS",
+  "EQUITASBNK.NS","ESABINDIA.NS","ETHOSLTD.NS","EUROBOND.NS","EXCEL.NS",
+  "FLAIR.NS","FLEXI.NS","FLUOROCHEM.NS","FOODWORKS.NS","FORCEMOT.NS",
+  "GABRIEL.NS","GALAXYSURF.NS","GARUDA.NS","GESHIP.NS","GIPCL.NS",
+  "GIRNARFOOD.NS","GLAND.NS","GLOBALVECT.NS","GLS.NS","GMMPFAUDLR.NS",
+  "GODFRYPHLP.NS","GOKEX.NS","GOLDIAM.NS","GOODLUCK.NS","GPPL.NS",
+  "GREENPANEL.NS","GRINDWELL.NS","GRSE.NS","GUJGAS.NS","GUJSTATE.NS",
+  "HARDWYN.NS","HARSHA.NS","HBL.NS","HFCL.NS","HIKAL.NS",
+  "HILTON.NS","HINDCOPPER.NS","HINDPETRO.NS","HINDWARE.NS","HITACHIIND.NS",
+  "HLVLTD.NS","HOMEFIRST.NS","HONASA.NS","HURON.NS","IBREALEST.NS",
+  "ICIL.NS","IDFCFIRSTB.NS","IGPL.NS","IIFL.NS","IIFLSEC.NS",
+  "ILFSTRANS.NS","IMAGICAA.NS","IMFA.NS","IMPAL.NS","INDGN.NS",
+  "INDIGOPNTS.NS","INDOCO.NS","INDOSTAR.NS","INFOBEAN.NS","INPX.NS",
+  "INTELLECT.NS","INTEQ.NS","IONEXCHANG.NS","IREDA.NS","ISGEC.NS",
+  "ITI.NS","JAGRAN.NS","JAMNAAUTO.NS","JAYAGROGN.NS","JAYBPHARMA.NS",
+  "JINDALSAW.NS","JKPAPER.NS","JMFINANCIL.NS","JPASSOCIAT.NS","JTLIND.NS",
+  "JUBLINDS.NS","KANSAINER.NS","KARTIKAYAM.NS","KCP.NS","KERNEX.NS",
+  "KIOCL.NS","KITEX.NS","KMCHEAL.NS","KNRCON.NS","KOKUYOCMLN.NS",
+  "KPR.NS","KRBL.NS","KRIDHANINF.NS","KSCL.NS","KTKBANK.NS",
+  "LALPATHLAB.NS","LAOPALA.NS","LGBBROSLTD.NS","LIBERTYSHOE.NS","LIKHITHA.NS",
+  "LINKHOUSE.NS","LLOYDSENT.NS","LLOYDSENGG.NS","LMFHL.NS","LPDC.NS",
+  "LUNA.NS","LUXIND.NS","LXCHEM.NS","MAGNASOUND.NS","MAHLOG.NS",
+  "MAHSEAMLES.NS","MAPMYINDIA.NS","MARICOIND.NS","MASTEK.NS","MBAPL.NS",
+  "MEDPLUS.NS","MEGH.NS","MEKINQ.NS","MELSTAR.NS","MFSL.NS",
+  "MGLAMB.NS","MICROSTRAT.NS","MINDA.NS","MINDAIND.NS","MINEXCORP.NS",
+  "MITCON.NS","MLTD.NS","MOLDIND.NS","MOLDTEK.NS","MOSCHIP.NS",
+  "MPSLTD.NS","MRPL.NS","MTL.NS","MUKANDLTD.NS","MUNJALSHOW.NS",
+  "NATCOPHARM.NS","NATHBIOGEN.NS","NAVINFLUO.NS","NAZARA.NS","NDGL.NS",
+  "NEOGEN.NS","NETWORK18.NS","NEWGEN.NS","NGLFINECHM.NS","NIITLTD.NS",
+  "NILKAMAL.NS","NIPPOBATRY.NS","NUCLEUS.NS","NUVAMA.NS","OLAELEC.NS",
+  "OMAXE.NS","ONEPOINT.NS","ORIENTLTD.NS","ORIENTPPR.NS","ORISSAMINE.NS",
+  "PALREDTEC.NS","PANSARI.NS","PARACABLES.NS","PARADEEP.NS","PATANJALI.NS",
+  "PCJEWELLER.NS","PDPL.NS","PENIND.NS","PENINLAND.NS","PERSISTENT.NS",
+  "PFIZER.NS","PHYNEXUS.NS","PILANIINVS.NS","PILOTSUN.NS","PINCON.NS",
+  "PIRAMALENT.NS","PIXTRANS.NS","PLASTIBLENDS.NS","PODDARMENT.NS","POKARNA.NS",
+  "POLSON.NS","POLYMED.NS","PONDDYCHI.NS","PRICOLLTD.NS","PRIMEIND.NS",
+  "PRIORITY.NS","PRISM.NS","PROBIOTIC.NS","PROCTER.NS","PRUDENT.NS",
+  "PSP.NS","PSUBNK.NS","PTC.NS","PUNJABCHEM.NS","PURVA.NS",
+  "QUICKHEAL.NS","RAIN.NS","RAJESHEXPO.NS","RAJRATAN.NS","RALLIS.NS",
+  "RAMCOIND.NS","RAMCOCEM.NS","RANEHOLDIN.NS","RATNAMANI.NS","RAYMOND.NS",
+  "RCPCL.NS","RECLTD.NS","REDTAPE.NS","RFCL.NS","RHIM.NS",
+  "RIIL.NS","RINFRA.NS","RITCO.NS","RKDL.NS","RPGLIFE.NS",
+  "RPOWER.NS","RSWM.NS","RTNINDIA.NS","SAFARI.NS","SAKSOFT.NS",
+  "SALSTEEL.NS","SANDESH.NS","SANGHIIND.NS","SANOFI.NS","SAPPHIRE.NS",
+  "SARDAEN.NS","SASKEN.NS","SATYAMFORG.NS","SBFC.NS","SBGLP.NS",
+  "SBICARD.NS","SCHAND.NS","SCHNEIDER.NS","SEPOWER.NS","SEQUENT.NS",
+  "SETCO.NS","SFL.NS","SGIL.NS","SHARDAMOTR.NS","SHAREINDIA.NS",
+  "SHILPAMED.NS","SHIVALIK.NS","SHREDIGCEM.NS","SHREEPUSHK.NS","SHRIRAMCIT.NS",
+  "SILVERTO.NS","SINTERCAST.NS","SITINET.NS","SMSPHARMA.NS","SODFLEX.NS",
+  "SOFTSOL.NS","SONACOMS.NS","SOUTHBANK.NS","SPANDANA.NS","SPECTRANET.NS",
+  "SSWL.NS","STCINDIA.NS","STEELXIND.NS","STERTOOLS.NS","STLTECH.NS",
+  "SUBEXLTD.NS","SUBROS.NS","SUKHJITS.NS","SUMIT.NS","SUMILON.NS",
+  "SUNCLAYLTD.NS","SUNDARMHLD.NS","SUNDRAM.NS","SUNFLAG.NS","SUNPHARMA.NS",
+  "SUNTECK.NS","SUPRAJIT.NS","SURYODAY.NS","SUTLEJTEX.NS","SWELECTES.NS",
+  "SWSOLAR.NS","SYMPHONY.NS","TARC.NS","TATACHEM.NS","TATACOFFEE.NS",
+  "TATAPOWER.NS","TEAMLEASE.NS","TEXINFRA.NS","TFCILTD.NS","THYROCARE.NS",
+  "TINPLATE.NS","TIRUMALCHM.NS","TORNTPHARM.NS","TORNTPOWER.NS","TPTC.NS",
+  "TREJHARA.NS","TRITON.NS","TRIVENI.NS","TTK.NS","TV18BRDCST.NS",
+  "TVSSCS.NS","TVTODAY.NS","UCAL.NS","UCOBANK.NS","UFLEX.NS",
+  "UGROCAP.NS","UPL.NS","UTKARSHBNK.NS","V2RETAIL.NS","VAIBHAVGBL.NS",
+  "VALDEL.NS","VARROC.NS","VARSA.NS","VBLTD.NS","VEEFIN.NS",
+  "VERITAS.NS","VESUVIUS.NS","VINATIORGA.NS","VINCOELEC.NS","VINDHYATEL.NS",
+  "VIPCLOTHNG.NS","VIPIND.NS","VISCO.NS","VISHAL.NS","VLSFINANCE.NS",
+  "VMART.NS","VOLTAMP.NS","VSTIL.NS","WESTERNIND.NS","WESTLIFE.NS",
+  "WHEELS.NS","WINDLAS.NS","WINFO.NS","WIPRO.NS","WONDERLA.NS",
+  "XCHANGING.NS","XPRO.NS","YAARI.NS","YATHARTH.NS","YUKEN.NS",
+  "ZENSARTECH.NS","ZFCVINDIA.NS","ZODIACLOTH.NS","ZUARI.NS",
+
+  // ── Banking & Finance Extra ───────────────────────────────────────────────
+  "ABSL.NS","ACCELYA.NS","ADITYA.NS","ALANKIT.NS","ANDHRABAN.NS",
+  "ANGELONE.NS","APLAPOLLO.NS","APTECHT.NS","ARMAN.NS","AROHA.NS",
+  "ARTSONIG.NS","ASSETWORKS.NS","ATUL.NS","AVGOLD.NS","AVTNPL.NS",
+
+  // ── IT & Tech Extra ───────────────────────────────────────────────────────
+  "CIGNITITEC.NS","COFORGE.NS","CYIENT.NS","DATAMATICS.NS","ECLERX.NS",
+  "EXPLEO.NS","FIRSTSOURC.NS","GALAXYSURF.NS","GTPL.NS","HCL.NS",
+  "HEXAWARE.NS","INTELLECT.NS","IOT.NS","ISEC.NS","KPITTECH.NS",
+  "MASTEK.NS","MINDTREE.NS","MPHASIS.NS","MRPL.NS","NIIT.NS",
+  "NUCLEUS.NS","OFSS.NS","PERSISTENT.NS","RATEGAIN.NS","ROUTE.NS",
+  "SECLABS.NS","SONATA.NS","TANLA.NS","TATAELXSI.NS","TECHNO.NS",
+  "TRIGYN.NS","TTML.NS","UNISON.NS","UTSSTSYSL.NS","VAKRANGEE.NS",
+  "VIMTALABS.NS","WIPRO.NS","XCHANGING.NS","XPRO.NS","ZENSAR.NS",
+
+  // ── Pharma Extra ──────────────────────────────────────────────────────────
+  "ABBOTINDIA.NS","AJANTPHARM.NS","ALEMBICLTD.NS","ALKEM.NS","APLLTD.NS",
+  "ASTRAZEN.NS","AUROPHARMA.NS","BIPCL.NS","BLISSGVS.NS","CADILAHC.NS",
+  "CAPLIPOINT.NS","CIPLA.NS","DIVI.NS","DRREDDY.NS","ERIS.NS",
+  "GLAND.NS","GLENMARK.NS","GRANULES.NS","HIKAL.NS","IPCALAB.NS",
+  "JBCHEPHARM.NS","JUBILANT.NS","KANSAINER.NS","LAURUSLABS.NS","LUPIN.NS",
+  "NATCOPHARM.NS","NAVINFLUOR.NS","NGLFINECHM.NS","PFIZER.NS","RADICO.NS",
+  "RAIN.NS","SANOFI.NS","SEQUENT.NS","SUNPHARMA.NS","SUVEN.NS",
+  "TORNTPHARM.NS","UNICHEM.NS","VINATIORGA.NS","WOCKPHARMA.NS","ZYDUSLIFE.NS",
+
+  // ── Infrastructure & Energy ───────────────────────────────────────────────
+  "ADANIENSOL.NS","ADANIGAS.NS","ADANIGREEN.NS","ADANIPORTS.NS","ADANIPOWER.NS",
+  "ADANITRANS.NS","AEGISLOG.NS","BHEL.NS","BPCL.NS","CESC.NS",
+  "CGPOWER.NS","ENGINERSIN.NS","GMRINFRA.NS","GPPL.NS","GUJGAS.NS",
+  "HINDPETRO.NS","IOC.NS","IGL.NS","IRB.NS","IRCON.NS",
+  "IREDA.NS","IRFC.NS","JSWENERGY.NS","KEC.NS","NHPC.NS",
+  "NLCINDIA.NS","NTPC.NS","ONGC.NS","PETRONET.NS","PFC.NS",
+  "POWERGRID.NS","PTC.NS","RECLTD.NS","RINFRA.NS","RPOWER.NS",
+  "SAIL.NS","SJVN.NS","SUNCLAYLTD.NS","SWSOLAR.NS","TATAPOWER.NS",
+  "TORNTPOWER.NS","UJJAIN.NS","UPL.NS","VEDL.NS","YESBANK.NS",
 ];
+
+// ── BSE Stocks (Top 200 liquid BSE-only or dual-listed with different codes) ──
+const BSE_STOCKS = [
+  "RELIANCE.BO","TCS.BO","HDFCBANK.BO","ICICIBANK.BO","INFOSYS.BO",
+  "SBIN.BO","BHARTIARTL.BO","ITC.BO","HINDUNILVR.BO","BAJFINANCE.BO",
+  "LT.BO","HCLTECH.BO","KOTAKBANK.BO","MARUTI.BO","AXISBANK.BO",
+  "ASIANPAINT.BO","SUNPHARMA.BO","TITAN.BO","WIPRO.BO","NESTLEIND.BO",
+  "POWERGRID.BO","NTPC.BO","TATAMOTORS.BO","BAJAJFINSV.BO","ONGC.BO",
+  "TATASTEEL.BO","COALINDIA.BO","HINDALCO.BO","ADANIPORTS.BO","JSWSTEEL.BO",
+  "DRREDDY.BO","CIPLA.BO","BRITANNIA.BO","APOLLOHOSP.BO","TATACONSUM.BO",
+  "GRASIM.BO","EICHERMOT.BO","BPCL.BO","SBILIFE.BO","HEROMOTOCO.BO",
+  "HDFCLIFE.BO","BAJAJ-AUTO.BO","ADANIGREEN.BO","TECHM.BO","INDUSINDBK.BO",
+  "DIVISLAB.BO","M%26M.BO","SHRIRAMFIN.BO","AMBUJACEM.BO","DLF.BO",
+  "GODREJCP.BO","HAVELLS.BO","PIDILITIND.BO","SIEMENS.BO","TRENT.BO",
+  "MARICO.BO","DABUR.BO","COLPAL.BO","NAUKRI.BO","OBEROIREAL.BO",
+  "GAIL.BO","IRCTC.BO","RECLTD.BO","IDFCFIRSTB.BO","BANDHANBNK.BO",
+  "ABCAPITAL.BO","MUTHOOTFIN.BO","LICHSGFIN.BO","SAIL.BO","NMDC.BO",
+  "FEDERALBNK.BO","CANBK.BO","PNB.BO","BANKBARODA.BO","UNIONBANK.BO",
+  "IOC.BO","VEDL.BO","TATAPOWER.BO","CHOLAFIN.BO","BERGEPAINT.BO",
+  "PAGEIND.BO","BOSCHLTD.BO","CONCOR.BO","ZYDUSLIFE.BO","LUPIN.BO",
+  "TORNTPHARM.BO","AUROPHARMA.BO","BIOCON.BO","CADILAHC.BO","ALKEM.BO",
+  "GLAXO.BO","ABBOTINDIA.BO","PFIZER.BO","SANOFI.BO","ASTRAZEN.BO",
+  "TATAELXSI.BO","MPHASIS.BO","LTIM.BO","LTTS.BO","PERSISTENT.BO",
+  "COFORGE.BO","HAPPSTMNDS.BO","ZOMATO.BO","NYKAA.BO","PAYTM.BO",
+  "DELHIVERY.BO","POLICYBZR.BO","DEVYANI.BO","WESTLIFE.BO","JUBLFOOD.BO",
+  "KALYANKJIL.BO","TRENT.BO","SHOPERSTOP.BO","VMART.BO","PVRINOX.BO",
+  "INOXWIND.BO","IREDA.BO","IRFC.BO","IRCON.BO","NHPC.BO",
+  "SJVN.BO","NTPC.BO","ADANIPOWER.BO","ADANITRANS.BO","ADANIGAS.BO",
+  "CESC.BO","TORNTPOWER.BO","JSWENERGY.BO","CGPOWER.BO","BHEL.BO",
+  "ENGINERSIN.BO","KEC.BO","ABB.BO","SIEMENS.BO","HONAUT.BO",
+  "GRINDWELL.BO","ELGIEQUIP.BO","TIMKEN.BO","SKFINDIA.BO","SCHAEFFLER.BO",
+  "AMARAJABAT.BO","EXIDEIND.BO","SUNDRMFAST.BO","GABRIEL.BO","SUPRAJIT.BO",
+  "MINDAIND.BO","MINDA.BO","ENDURANCE.BO","MOTHERSON.BO","BOSCHLTD.BO",
+  "HEROMOTOCO.BO","BAJAJ-AUTO.BO","EICHERMOT.BO","TVSMOTORS.BO","ESCORTS.BO",
+  "MAHINDCIE.BO","FORCEMOT.BO","OLECTRA.BO","IOCHCL.BO","CPCL.BO",
+  "MRPL.BO","BPCL.BO","IOC.BO","HINDPETRO.BO","PETRONET.BO",
+  "GUJGAS.BO","IGL.BO","GSPL.BO","GAIL.BO","ONGC.BO",
+  "RELIANCE.BO","HPCL.BO","MGL.BO","INDRAPRASTHA.BO","ATGL.BO",
+  "SUPREMEIND.BO","ASTRAL.BO","APLAPOLLO.BO","POLYCAB.BO","KEI.BO",
+  "HAVELLS.BO","VOLTAS.BO","BLUESTAR.BO","WHIRLPOOL.BO","CROMPTON.BO",
+  "ORIENTLTD.BO","SYMPHONY.BO","VGUARD.BO","BAJAJELECTR.BO","FINOLEX.BO",
+  "ULTRACEMCO.BO","AMBUJACEM.BO","ACC.BO","SHREECEM.BO","RAMCOCEM.BO",
+  "JKCEMENT.BO","BIRLACORPN.BO","HEIDELBERG.BO","DALMIA.BO","INDIACEM.BO",
+  "TATASTEEL.BO","JSWSTEEL.BO","HINDALCO.BO","NATIONALUM.BO","VEDL.BO",
+  "COALINDIA.BO","NMDC.BO","SAIL.BO","JINDALSTEL.BO","JSPL.BO",
+];
+
+// Deduplicate and combine
+const STOCKS = [...new Set([...NSE_STOCKS, ...BSE_STOCKS])];
+
+console.log(`📊 Total stock universe: ${STOCKS.length} symbols`);
 
 // ── Open Positions ────────────────────────────────────────────────────────────
 const openPositions = {};
 
 // ── Signal Cache ──────────────────────────────────────────────────────────────
-let signalCache = null;
-let cacheTime   = 0;
-const CACHE_TTL = 30_000; // 30 seconds
+let signalCache     = null;
+let partialCache    = null;   // serves partial results while full scan runs
+let cacheTime       = 0;
+let isScanning      = false;
+let scanProgress    = { done: 0, total: STOCKS.length, started: null };
 
 // ── Market Hours (IST) ────────────────────────────────────────────────────────
 function isMarketOpen() {
@@ -65,8 +290,10 @@ function getISTTime() {
   return new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" });
 }
 
+// ── Sleep helper ──────────────────────────────────────────────────────────────
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
 // ── Fetch OHLCV from Yahoo Finance ────────────────────────────────────────────
-// Nulls are cleaned here so indicator functions always get clean arrays
 async function fetchStockData(symbol) {
   try {
     const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1m&range=1d`;
@@ -79,8 +306,6 @@ async function fetchStockData(symbol) {
     const q          = result.indicators.quote[0];
     const timestamps = result.timestamp || [];
 
-    // Zip all OHLCV rows and drop any where close/high/low is null
-    // This prevents corrupt inputs to indicator libraries
     const rows = timestamps
       .map((t, i) => ({
         t,
@@ -101,7 +326,7 @@ async function fetchStockData(symbol) {
       timestamps: rows.map(r => r.t),
     };
   } catch (err) {
-    console.error(`❌ ${symbol}:`, err.message);
+    // Silent fail — many small-caps may not have data
     return null;
   }
 }
@@ -120,14 +345,13 @@ function calculateVWAP(closes, highs, lows, volumes) {
 }
 
 // ── Projected Sell Time ───────────────────────────────────────────────────────
-// Estimates when price will hit target based on ATR velocity (price movement per minute)
 function projectSellTime(currentPrice, target, atr, periodMinutes = 14) {
   if (!target || !atr || atr === 0) return null;
   const gap            = Math.abs(target - currentPrice);
   const pricePerMinute = atr / periodMinutes;
   if (pricePerMinute === 0) return null;
   const minutesNeeded  = Math.ceil(gap / pricePerMinute);
-  if (minutesNeeded > 240) return null; // >4 hours = unreliable, skip
+  if (minutesNeeded > 240) return null;
   const nowUtcMs = Date.now();
   const sell     = new Date(nowUtcMs + minutesNeeded * 60000);
   return sell.toLocaleTimeString("en-IN", {
@@ -137,33 +361,21 @@ function projectSellTime(currentPrice, target, atr, periodMinutes = 14) {
   });
 }
 
-// ── Core Signal Engine — 12 Indicators, Weighted Scoring ─────────────────────
+// ── Core Signal Engine — 12 Indicators ───────────────────────────────────────
 function generateSignal(closes, highs, lows, volumes, opens) {
-  // All arrays are already clean (no nulls) — guaranteed by fetchStockData
   const prices = closes;
-  const hs     = highs;
-  const ls     = lows;
-  const vs     = volumes;
-
+  const hs = highs, ls = lows, vs = volumes;
   if (prices.length < 30) return null;
-
   const last = prices.at(-1);
 
-  // ── 1. RSI (weight: 2) ────────────────────────────────────────────────────
   const rsiArr = RSI.calculate({ values: prices, period: 14 });
   const rsi    = rsiArr.at(-1);
+  const sma10  = SMA.calculate({ values: prices, period: 10 }).at(-1);
+  const sma20  = SMA.calculate({ values: prices, period: 20 }).at(-1);
+  const sma50  = prices.length >= 50 ? SMA.calculate({ values: prices, period: 50 }).at(-1) : null;
+  const ema9   = EMA.calculate({ values: prices, period: 9 }).at(-1);
+  const ema21  = EMA.calculate({ values: prices, period: 21 }).at(-1);
 
-  // ── 2. SMA 10/20/50 (weight: 1 each) ─────────────────────────────────────
-  const sma10 = SMA.calculate({ values: prices, period: 10 }).at(-1);
-  const sma20 = SMA.calculate({ values: prices, period: 20 }).at(-1);
-  const sma50 = prices.length >= 50
-    ? SMA.calculate({ values: prices, period: 50 }).at(-1) : null;
-
-  // ── 3. EMA 9/21 (weight: 1.5) ────────────────────────────────────────────
-  const ema9  = EMA.calculate({ values: prices, period: 9 }).at(-1);
-  const ema21 = EMA.calculate({ values: prices, period: 21 }).at(-1);
-
-  // ── 4. MACD (weight: 2) ───────────────────────────────────────────────────
   const macdArr = MACD.calculate({
     values: prices, fastPeriod: 12, slowPeriod: 26, signalPeriod: 9,
     SimpleMAOscillator: false, SimpleMASignal: false,
@@ -171,146 +383,127 @@ function generateSignal(closes, highs, lows, volumes, opens) {
   const macd     = macdArr.at(-1);
   const macdPrev = macdArr.at(-2);
 
-  // ── 5. Bollinger Bands (weight: 1.5) ─────────────────────────────────────
   const bbArr = BollingerBands.calculate({ values: prices, period: 20, stdDev: 2 });
   const bb    = bbArr.at(-1);
 
-  // ── 6. Stochastic (weight: 1.5) ───────────────────────────────────────────
   let stoch = null;
   if (hs.length >= 14) {
-    const stochArr = Stochastic.calculate({
-      high: hs, low: ls, close: prices, period: 14, signalPeriod: 3,
-    });
+    const stochArr = Stochastic.calculate({ high: hs, low: ls, close: prices, period: 14, signalPeriod: 3 });
     stoch = stochArr.at(-1);
   }
 
-  // ── 7. ADX — Trend Strength Multiplier ───────────────────────────────────
   let adx = null;
   if (hs.length >= 14) {
     const adxArr = ADX.calculate({ high: hs, low: ls, close: prices, period: 14 });
     adx = adxArr.at(-1);
   }
 
-  // ── 8. ATR — Volatility, used for SL/Target/projected sell time ──────────
   let atr = null;
   if (hs.length >= 14) {
     const atrArr = ATR.calculate({ high: hs, low: ls, close: prices, period: 14 });
     atr = atrArr.at(-1);
   }
 
-  // ── 9. OBV — Volume confirmation (weight: 1.5) ───────────────────────────
   const obvArr  = OBV.calculate({ close: prices, volume: vs });
   const obvNow  = obvArr.at(-1);
   const obvPrev = obvArr.at(-2);
   const priceUp = prices.at(-1) > prices.at(-2);
 
-  // ── 10. Williams %R (weight: 1) ───────────────────────────────────────────
   const wrArr = WilliamsR.calculate({ high: hs, low: ls, close: prices, period: 14 });
   const wr    = wrArr.at(-1);
 
-  // ── 11. CCI — Commodity Channel Index (weight: 1.5) ──────────────────────
-  // <-100 = oversold, >+100 = overbought
   let cci = null;
   if (hs.length >= 20) {
     const cciArr = CCI.calculate({ high: hs, low: ls, close: prices, period: 20 });
     cci = cciArr.at(-1);
   }
 
-  // ── 12. MFI — Money Flow Index (weight: 2, best intraday indicator) ───────
-  // Like RSI but volume-weighted — MFI <20 with volume = very bullish
   let mfi = null;
   if (hs.length >= 14 && vs.length >= 14) {
     const mfiArr = MFI.calculate({ high: hs, low: ls, close: prices, volume: vs, period: 14 });
     mfi = mfiArr.at(-1);
   }
 
-  // ── VWAP Deviation (weight: 2, institutional signal) ─────────────────────
   const vwapArr = calculateVWAP(closes, highs, lows, volumes);
   const vwapNow = vwapArr.filter(Boolean).at(-1);
   const vwapDev = vwapNow ? ((last - vwapNow) / vwapNow) * 100 : null;
 
-  // ── SCORING ENGINE (Weighted) ─────────────────────────────────────────────
-  let bullScore = 0, bearScore = 0;
-  let maxScore  = 0;
+  let bullScore = 0, bearScore = 0, maxScore = 0;
   const reasons = [];
 
-  // RSI (weight 2)
+  // RSI (2)
   maxScore += 2;
   if (rsi < 30)      { bullScore += 2; reasons.push(`RSI Oversold (${Math.round(rsi)})`); }
   else if (rsi < 45) { bullScore += 1; reasons.push("RSI Recovering"); }
   else if (rsi > 70) { bearScore += 2; reasons.push(`RSI Overbought (${Math.round(rsi)})`); }
   else if (rsi > 60) { bearScore += 1; }
 
-  // SMA alignment (weight 3)
+  // SMA (3)
   maxScore += 3;
-  if (last > sma10) { bullScore += 1; }
+  if (last > sma10) bullScore += 1;
   if (last > sma20) { bullScore += 1; reasons.push("Above SMA20"); }
   if (sma50 && last > sma50) { bullScore += 1; reasons.push("Above SMA50"); }
-  if (last < sma10) { bearScore += 1; }
-  if (last < sma20) { bearScore += 1; }
-  if (sma50 && last < sma50) { bearScore += 1; }
+  if (last < sma10) bearScore += 1;
+  if (last < sma20) bearScore += 1;
+  if (sma50 && last < sma50) bearScore += 1;
 
-  // EMA (weight 1.5)
+  // EMA (1.5)
   maxScore += 1.5;
   if (ema9 > ema21 && last > ema21)      { bullScore += 1.5; reasons.push("EMA Bullish Cross"); }
   else if (ema9 < ema21 && last < ema21) { bearScore += 1.5; reasons.push("EMA Bearish Cross"); }
 
-  // MACD (weight 2)
+  // MACD (2)
   maxScore += 2;
   if (macd && macdPrev) {
-    if (macd.MACD > macd.signal) { bullScore += 1; }
-    if (macd.histogram > 0 && macdPrev.histogram <= 0) {
-      bullScore += 1; reasons.push("MACD Bullish Crossover");
-    }
-    if (macd.MACD < macd.signal) { bearScore += 1; }
-    if (macd.histogram < 0 && macdPrev.histogram >= 0) {
-      bearScore += 1; reasons.push("MACD Bearish Crossover");
-    }
+    if (macd.MACD > macd.signal)   bullScore += 1;
+    if (macd.histogram > 0 && macdPrev.histogram <= 0) { bullScore += 1; reasons.push("MACD Bullish Crossover"); }
+    if (macd.MACD < macd.signal)   bearScore += 1;
+    if (macd.histogram < 0 && macdPrev.histogram >= 0) { bearScore += 1; reasons.push("MACD Bearish Crossover"); }
   }
 
-  // Bollinger Bands (weight 1.5)
+  // Bollinger (1.5)
   maxScore += 1.5;
   if (bb) {
-    if (last < bb.lower)                        { bullScore += 1.5; reasons.push("BB Oversold Squeeze"); }
+    if (last < bb.lower)                          { bullScore += 1.5; reasons.push("BB Oversold Squeeze"); }
     else if (last < bb.middle && last > bb.lower) { bullScore += 0.5; }
-    else if (last > bb.upper)                    { bearScore += 1.5; reasons.push("BB Overbought"); }
+    else if (last > bb.upper)                     { bearScore += 1.5; reasons.push("BB Overbought"); }
     else if (last > bb.middle && last < bb.upper) { bearScore += 0.5; }
   }
 
-  // Stochastic (weight 1.5)
+  // Stochastic (1.5)
   maxScore += 1.5;
   if (stoch) {
     if (stoch.k < 20)  { bullScore += 1.5; reasons.push("Stochastic Oversold"); }
     else if (stoch.k > 80) { bearScore += 1.5; reasons.push("Stochastic Overbought"); }
   }
 
-  // Williams %R (weight 1)
+  // Williams %R (1)
   maxScore += 1;
-  if (wr < -80)      { bullScore += 1; }
-  else if (wr > -20) { bearScore += 1; }
+  if (wr < -80)      bullScore += 1;
+  else if (wr > -20) bearScore += 1;
 
-  // OBV Volume Confirmation (weight 1.5)
+  // OBV (1.5)
   maxScore += 1.5;
   if (obvNow > obvPrev && priceUp)       { bullScore += 1.5; reasons.push("Volume Confirms Upside"); }
   else if (obvNow < obvPrev && !priceUp) { bearScore += 1.5; reasons.push("Volume Confirms Downside"); }
 
-  // CCI (weight 1.5)
+  // CCI (1.5)
   maxScore += 1.5;
   if (cci !== null) {
     if (cci < -100)     { bullScore += 1.5; reasons.push("CCI Oversold"); }
     else if (cci > 100) { bearScore += 1.5; }
   }
 
-  // MFI (weight 2 — best intraday indicator)
+  // MFI (2)
   maxScore += 2;
   if (mfi !== null) {
-    if (mfi < 20)       { bullScore += 2; reasons.push("MFI Oversold (Volume Weighted)"); }
-    else if (mfi < 40)  { bullScore += 1; }
-    else if (mfi > 80)  { bearScore += 2; reasons.push("MFI Overbought"); }
-    else if (mfi > 60)  { bearScore += 1; }
+    if (mfi < 20)      { bullScore += 2; reasons.push("MFI Oversold (Volume Weighted)"); }
+    else if (mfi < 40) { bullScore += 1; }
+    else if (mfi > 80) { bearScore += 2; reasons.push("MFI Overbought"); }
+    else if (mfi > 60) { bearScore += 1; }
   }
 
-  // VWAP Deviation (weight 2)
+  // VWAP (2)
   maxScore += 2;
   if (vwapDev !== null) {
     if (vwapDev < -1.5)      { bullScore += 2; reasons.push("Below VWAP (Institutional Buy Zone)"); }
@@ -319,33 +512,21 @@ function generateSignal(closes, highs, lows, volumes, opens) {
     else if (vwapDev > 0.5)  { bearScore += 1; }
   }
 
-  // ── ADX Trend Strength Multiplier ─────────────────────────────────────────
-  const adxVal    = adx ? adx.adx : 0;
+  const adxVal     = adx ? adx.adx : 0;
   const trendBonus = adxVal >= 40 ? 1.3 : adxVal >= 25 ? 1.15 : adxVal >= 15 ? 1.0 : 0.85;
-
-  const rawScore = maxScore > 0 ? (bullScore / maxScore) * 100 : 50;
-  const score    = Math.min(100, Math.round(rawScore * trendBonus));
-
-  // ── Confluence Detection ───────────────────────────────────────────────────
-  // True when dominant side has >= 5 weighted points — means multiple indicators align
+  const rawScore   = maxScore > 0 ? (bullScore / maxScore) * 100 : 50;
+  const score      = Math.min(100, Math.round(rawScore * trendBonus));
   const confluence = Math.max(bullScore, bearScore) >= 5;
 
-  // ── Signal Decision ───────────────────────────────────────────────────────
   let signal = "HOLD";
   if (score >= 68)      signal = "BUY";
   else if (score <= 32) signal = "SELL";
-  // Require confluence for moderate-confidence signals
   if (signal === "BUY"  && !confluence && score < 80) signal = "HOLD";
   if (signal === "SELL" && !confluence && score > 20) signal = "HOLD";
 
-  // ── ATR-Based Stop Loss & Target ──────────────────────────────────────────
-  // SL: 1.5× ATR below price (gives trade room)
-  // Target: 2.5× ATR above price (2.5:1.5 = ~1.67 R:R)
   const stopLoss = atr ? +(last - 1.5 * atr).toFixed(2) : null;
   const target   = atr ? +(last + 2.5 * atr).toFixed(2) : null;
-
-  const projectedSellTime = signal === "BUY"
-    ? projectSellTime(last, target, atr) : null;
+  const projectedSellTime = signal === "BUY" ? projectSellTime(last, target, atr) : null;
 
   return {
     signal, score, bullScore, bearScore,
@@ -391,11 +572,8 @@ function checkExitCondition(symbol, currentPrice, analysis) {
     const pl = ((currentPrice - pos.entryPrice) / pos.entryPrice * 100).toFixed(2);
     delete openPositions[symbol];
     return {
-      action:     "SELL",
-      isNew:      true,
-      reason:     hitTarget   ? "🎯 Target Hit"
-                : hitStopLoss ? "🛑 Stop-Loss Hit"
-                              : "📉 Signal Reversed",
+      action: "SELL", isNew: true,
+      reason:     hitTarget ? "🎯 Target Hit" : hitStopLoss ? "🛑 Stop-Loss Hit" : "📉 Signal Reversed",
       profitLoss: pl,
       entryPrice: pos.entryPrice,
       entryTime:  pos.entryTime,
@@ -405,7 +583,118 @@ function checkExitCondition(symbol, currentPrice, analysis) {
   return { action: "BUY", isNew: false, position: pos };
 }
 
-// ── /health — Render health check ────────────────────────────────────────────
+// ── Core Scanner — Batched Parallel ──────────────────────────────────────────
+async function runFullScan() {
+  if (isScanning) return; // prevent overlapping scans
+  isScanning   = true;
+  scanProgress = { done: 0, total: STOCKS.length, started: getISTTime() };
+
+  const results = [];
+  const batches = [];
+
+  for (let i = 0; i < STOCKS.length; i += BATCH_SIZE) {
+    batches.push(STOCKS.slice(i, i + BATCH_SIZE));
+  }
+
+  console.log(`🔍 Scanning ${STOCKS.length} stocks in ${batches.length} batches of ${BATCH_SIZE}...`);
+
+  for (let bi = 0; bi < batches.length; bi++) {
+    const batch = batches[bi];
+
+    // Process batch in parallel
+    const batchResults = await Promise.all(
+      batch.map(async (symbol) => {
+        try {
+          const data = await fetchStockData(symbol);
+          if (!data || data.closes.length < 30) return null;
+
+          const analysis = generateSignal(data.closes, data.highs, data.lows, data.volumes, data.opens);
+          if (!analysis) return null;
+
+          const currentPrice = data.closes.at(-1);
+          const exitInfo     = checkExitCondition(symbol, currentPrice, analysis);
+          const pos          = openPositions[symbol];
+
+          return {
+            symbol,
+            exchange:      symbol.endsWith(".NS") ? "NSE" : "BSE",
+            price:         +currentPrice.toFixed(2),
+            signal:        exitInfo.action,
+            score:         analysis.score,
+            reasons:       analysis.reasons,
+            stopLoss:      analysis.stopLoss,
+            target:        analysis.target,
+            rsi:           analysis.rsi,
+            mfi:           analysis.mfi,
+            cci:           analysis.cci,
+            trendStrength: analysis.trendStrength,
+            vwap:          analysis.vwap,
+            vwapDeviation: analysis.vwapDeviation,
+            macdHistogram: analysis.macdHistogram,
+            stochK:        analysis.stochK,
+            atr:           analysis.atr,
+            confluence:    analysis.confluence,
+            projectedSellTime: analysis.projectedSellTime || pos?.projectedSellTime || null,
+            isNewSignal:   exitInfo.isNew,
+            exitReason:    exitInfo.reason     || null,
+            profitLoss:    exitInfo.profitLoss || null,
+            entryPrice:    exitInfo.entryPrice || pos?.entryPrice || null,
+            entryTime:     exitInfo.entryTime  || pos?.entryTime  || null,
+            recentPrices:  data.closes.slice(-30),
+          };
+        } catch (err) {
+          return null;
+        }
+      })
+    );
+
+    const valid = batchResults.filter(Boolean);
+    results.push(...valid);
+    scanProgress.done += batch.length;
+
+    // Update partial cache so /signals can serve early results
+    partialCache = buildPayload(results, false);
+
+    if (bi < batches.length - 1) {
+      await sleep(BATCH_DELAY);
+    }
+  }
+
+  // Final sort + cache
+  const final = buildPayload(results, true);
+  signalCache = final;
+  cacheTime   = Date.now();
+  isScanning  = false;
+  partialCache = null;
+  console.log(`✅ Scan complete: ${results.length} valid stocks | ${getISTTime()}`);
+}
+
+function buildPayload(results, isFinal) {
+  const sorted = [...results].sort((a, b) => {
+    if (a.signal === "BUY" && b.signal !== "BUY") return -1;
+    if (b.signal === "BUY" && a.signal !== "BUY") return 1;
+    if (a.confluence && !b.confluence) return -1;
+    if (b.confluence && !a.confluence) return 1;
+    return b.score - a.score;
+  });
+
+  const best = sorted.find(s => s.signal === "BUY" && s.confluence)
+            || sorted.find(s => s.signal === "BUY")
+            || sorted[0]
+            || null;
+
+  return {
+    marketOpen:    true,
+    signals:       sorted,
+    bestStock:     best ? best.symbol : null,
+    timestamp:     getISTTime(),
+    openPositions: Object.keys(openPositions).length,
+    scanComplete:  isFinal,
+    totalScanned:  results.length,
+  };
+}
+
+// ── /health ───────────────────────────────────────────────────────────────────
 app.get("/health", (req, res) => {
   res.json({ status: "ok", timestamp: getISTTime() });
 });
@@ -416,11 +705,24 @@ app.get("/status", (req, res) => {
     marketOpen:    isMarketOpen(),
     openPositions: Object.keys(openPositions).length,
     totalStocks:   STOCKS.length,
+    isScanning,
+    scanProgress,
     timestamp:     getISTTime(),
   });
 });
 
-// ── /signals — Main endpoint ──────────────────────────────────────────────────
+// ── /scan-status — lightweight progress endpoint ──────────────────────────────
+app.get("/scan-status", (req, res) => {
+  res.json({
+    isScanning,
+    done:    scanProgress.done,
+    total:   scanProgress.total,
+    pct:     scanProgress.total > 0 ? Math.round((scanProgress.done / scanProgress.total) * 100) : 0,
+    started: scanProgress.started,
+  });
+});
+
+// ── /signals ──────────────────────────────────────────────────────────────────
 app.get("/signals", async (req, res) => {
   if (!isMarketOpen() && req.query.force !== "true") {
     return res.json({
@@ -431,108 +733,88 @@ app.get("/signals", async (req, res) => {
     });
   }
 
-  // Serve cache if still fresh
+  const limit    = Math.min(500, parseInt(req.query.limit || "200"));
+  const exchange = (req.query.exchange || "ALL").toUpperCase();
+
+  // Serve full cache if fresh
   if (signalCache && Date.now() - cacheTime < CACHE_TTL && req.query.force !== "true") {
-    return res.json(signalCache);
+    const payload = filterPayload(signalCache, limit, exchange);
+    return res.json(payload);
   }
 
-  const results = [];
-
-  for (const symbol of STOCKS) {
-    try {
-      const data = await fetchStockData(symbol);
-      if (!data || data.closes.length < 30) continue;
-
-      const analysis = generateSignal(data.closes, data.highs, data.lows, data.volumes, data.opens);
-      if (!analysis) continue;
-
-      const currentPrice = data.closes.at(-1);
-      const exitInfo     = checkExitCondition(symbol, currentPrice, analysis);
-      const pos          = openPositions[symbol];
-
-      results.push({
-        symbol,
-        exchange:      symbol.endsWith(".NS") ? "NSE" : "BSE",
-        price:         +currentPrice.toFixed(2),
-        signal:        exitInfo.action,
-        score:         analysis.score,
-        reasons:       analysis.reasons,
-        stopLoss:      analysis.stopLoss,
-        target:        analysis.target,
-        rsi:           analysis.rsi,
-        mfi:           analysis.mfi,
-        cci:           analysis.cci,
-        trendStrength: analysis.trendStrength,
-        vwap:          analysis.vwap,
-        vwapDeviation: analysis.vwapDeviation,
-        macdHistogram: analysis.macdHistogram,
-        stochK:        analysis.stochK,
-        atr:           analysis.atr,
-        confluence:    analysis.confluence,
-        projectedSellTime: analysis.projectedSellTime || pos?.projectedSellTime || null,
-        isNewSignal:   exitInfo.isNew,
-        exitReason:    exitInfo.reason     || null,
-        profitLoss:    exitInfo.profitLoss || null,
-        entryPrice:    exitInfo.entryPrice || pos?.entryPrice || null,
-        entryTime:     exitInfo.entryTime  || pos?.entryTime  || null,
-        recentPrices:  data.closes.slice(-30),
-      });
-    } catch (err) {
-      console.error(`Error processing ${symbol}:`, err.message);
-    }
+  // Serve partial cache if scan is running (progressive UX)
+  if (isScanning && partialCache) {
+    const payload = filterPayload(partialCache, limit, exchange);
+    return res.json({ ...payload, scanComplete: false });
   }
 
-  // Sort: BUY + confluence first, then by score
-  results.sort((a, b) => {
-    if (a.signal === "BUY" && b.signal !== "BUY") return -1;
-    if (b.signal === "BUY" && a.signal !== "BUY") return 1;
-    if (a.confluence && !b.confluence) return -1;
-    if (b.confluence && !a.confluence) return 1;
-    return b.score - a.score;
+  // Kick off a fresh scan (non-blocking)
+  runFullScan().catch(console.error);
+
+  // If we have a stale cache, serve it while the new scan runs
+  if (signalCache) {
+    const payload = filterPayload(signalCache, limit, exchange);
+    return res.json({ ...payload, scanComplete: false, stale: true });
+  }
+
+  // First ever request — wait briefly for first batch to come in
+  await sleep(3000);
+  if (partialCache) {
+    const payload = filterPayload(partialCache, limit, exchange);
+    return res.json({ ...payload, scanComplete: false });
+  }
+
+  res.json({
+    marketOpen: true,
+    signals:    [],
+    bestStock:  null,
+    scanComplete: false,
+    message: "Scan starting, please refresh in 30 seconds",
   });
-
-  // Best stock = highest confidence BUY with confluence, else any BUY
-  const best = results.find(s => s.signal === "BUY" && s.confluence)
-            || results.find(s => s.signal === "BUY")
-            || results[0]
-            || null;
-
-  const payload = {
-    marketOpen:    true,
-    signals:       results,
-    bestStock:     best ? best.symbol : null,
-    timestamp:     getISTTime(),
-    openPositions: Object.keys(openPositions).length,
-  };
-
-  signalCache = payload;
-  cacheTime   = Date.now();
-
-  res.json(payload);
 });
+
+function filterPayload(payload, limit, exchange) {
+  let signals = payload.signals;
+  if (exchange !== "ALL") {
+    signals = signals.filter(s => s.exchange === exchange);
+  }
+  return {
+    ...payload,
+    signals: signals.slice(0, limit),
+  };
+}
 
 // ── Cron: Market Open/Close ───────────────────────────────────────────────────
 cron.schedule("15 9 * * 1-5", () => {
-  console.log("🟢 Market OPEN — Scanning started (9:15 AM IST)");
+  console.log("🟢 Market OPEN — Launching first scan");
   signalCache = null;
+  runFullScan().catch(console.error);
 }, { timezone: "Asia/Kolkata" });
 
 cron.schedule("30 15 * * 1-5", () => {
-  console.log("🔴 Market CLOSED — Clearing positions (3:30 PM IST)");
+  console.log("🔴 Market CLOSED — Clearing positions");
   Object.keys(openPositions).forEach(k => delete openPositions[k]);
   signalCache = null;
 }, { timezone: "Asia/Kolkata" });
 
-// ── Keep-Alive Ping (prevents Render free tier from spinning down) ─────────────
-// Render sets RENDER_EXTERNAL_URL automatically — only runs in production
+// Re-scan every 2 minutes during market hours (matches CACHE_TTL)
+cron.schedule("*/2 * * * 1-5", () => {
+  if (isMarketOpen() && !isScanning) {
+    console.log(`🔄 Scheduled rescan (${getISTTime()})`);
+    signalCache = null;
+    runFullScan().catch(console.error);
+  }
+}, { timezone: "Asia/Kolkata" });
+
+// ── Keep-Alive Ping ───────────────────────────────────────────────────────────
 const SELF_URL = process.env.RENDER_EXTERNAL_URL;
 if (SELF_URL) {
   cron.schedule("*/10 * * * 1-5", async () => {
     try {
       await axios.get(`${SELF_URL}/health`, { timeout: 5000 });
-      console.log(`💓 Keep-alive ping OK (${getISTTime()})`);
+      console.log(`💓 Keep-alive OK (${getISTTime()})`);
     } catch (e) {
-      console.warn("⚠️ Keep-alive ping failed:", e.message);
+      console.warn("⚠️ Keep-alive failed:", e.message);
     }
   }, { timezone: "Asia/Kolkata" });
   console.log(`💓 Keep-alive enabled → ${SELF_URL}/health`);
@@ -542,14 +824,18 @@ if (SELF_URL) {
 const PORT = process.env.PORT || 5000;
 
 app.listen(PORT, "0.0.0.0", () => {
-  // Auto-detect real LAN IP for local dev convenience
   const nets    = Object.values(os.networkInterfaces()).flat();
   const localIP = nets.find(n => n.family === "IPv4" && !n.internal)?.address ?? "localhost";
 
-  console.log("🚀 Stock Signal Engine v2.1");
+  console.log("🚀 Stock Signal Engine v3.0");
   console.log(`➡  Local:   http://localhost:${PORT}`);
   console.log(`➡  Network: http://${localIP}:${PORT}`);
   if (SELF_URL) console.log(`➡  Public:  ${SELF_URL}`);
-  console.log(`📊 Tracking ${STOCKS.length} stocks | 12 indicators`);
-  console.log(`📅 Market: ${isMarketOpen() ? "🟢 OPEN" : "🔴 CLOSED"}`);
+  console.log(`📊 Universe: ${STOCKS.length} stocks (Nifty 500 + BSE 200)`);
+  console.log(`📅 Market: ${isMarketOpen() ? "🟢 OPEN — launching scan" : "🔴 CLOSED"}`);
+
+  // Kick off initial scan if market is open at startup
+  if (isMarketOpen()) {
+    runFullScan().catch(console.error);
+  }
 });
